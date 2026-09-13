@@ -1,0 +1,126 @@
+name: 每日同步上游仓库
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # UTC每6小时执行一次：0,6,12,18点 → 北京时间 8,14,20,02点
+  workflow_dispatch:      # 支持网页手动一键触发同步
+
+env:
+  # ======================【这里只改这一块配置即可】======================
+  UPSTREAM_REPO: "cmliu/edgetunnel"      # 上游仓库 格式 owner/repo
+  TARGET_BRANCH: "main"            # 自己仓库要同步推送的本地分支
+  KEEP_WORKFLOW_FILE: ".github/workflows/sync-upstream.yml" # 需要保护不被上游覆盖的本工作流
+  KEEP_RUNS_COUNT: 5                # 保留多少条旧action运行记录
+  # ====================================================================
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 准备环境（安装 jq）
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: 使用 git clone 检出目标分支（替代 actions/checkout）
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.SYNC_PAT }}
+          TARGET: ${{ env.TARGET_BRANCH }}
+        run: |
+          set -euo pipefail
+          # 使用 token 克隆完整仓库
+          rm -rf repo
+          git clone https://x-access-token:${TOKEN}@github.com/${REPO}.git repo
+          cd repo
+          # 确保存在并切到目标分支（若不存在则创建）
+          if git show-ref --verify --quiet refs/heads/${TARGET}; then
+            git checkout ${TARGET}
+          else
+            git checkout -b ${TARGET}
+          fi
+        shell: bash
+
+      - name: 备份需要保护的工作流脚本
+        working-directory: repo
+        run: |
+          mkdir -p /tmp/wf_backup
+          cp ${{ env.KEEP_WORKFLOW_FILE }} /tmp/wf_backup/sync-workflow.yml || true
+
+      - name: 拉取上游仓库最新源码
+        working-directory: repo
+        run: |
+          set -e
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git || true
+          git fetch upstream --tags --prune
+
+      - name: 获取上游默认分支 & 强制重置代码
+        working-directory: repo
+        run: |
+          set -e
+          UPSTREAM_BRANCH=$(git remote show upstream | grep 'HEAD branch' | awk '{print $NF}')
+          echo "上游仓库默认分支: $UPSTREAM_BRANCH"
+          git reset --hard upstream/$UPSTREAM_BRANCH
+
+      - name: 恢复被保护的本地工作流文件
+        working-directory: repo
+        run: |
+          mkdir -p $(dirname ${{ env.KEEP_WORKFLOW_FILE }})
+          cp /tmp/wf_backup/sync-workflow.yml ${{ env.KEEP_WORKFLOW_FILE }}
+          git add ${{ env.KEEP_WORKFLOW_FILE }} || true
+
+      - name: 提交恢复文件，无变更自动跳过
+        working-directory: repo
+        run: |
+          set -e || true
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: restore self‑protected workflow file" || echo "✅ 无变更，跳过本次提交"
+
+      - name: 强制推送到个人仓库目标分支
+        working-directory: repo
+        env:
+          TOKEN: ${{ secrets.SYNC_PAT }}
+          TARGET: ${{ env.TARGET_BRANCH }}
+        run: |
+          set -e
+          # 使用 token 推送
+          git push https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git ${TARGET} --force
+
+      - name: 清理旧 Workflow 运行记录（使用 GitHub API 替代第三方 action）
+        env:
+          TOKEN: ${{ secrets.SYNC_PAT }}
+          REPO: ${{ github.repository }}
+          KEEP: ${{ env.KEEP_RUNS_COUNT }}
+          WORKFLOW_FILE: sync-upstream.yml
+        run: |
+          set -eu
+          echo "获取 workflow id..."
+          wf_json=$(curl -s -H "Authorization: token ${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW_FILE}")
+          wf_id=$(echo "$wf_json" | jq -r '.id // empty')
+          if [ -z "$wf_id" ]; then
+            echo "无法获取 workflow id，响应："
+            echo "$wf_json"
+            exit 0
+          fi
+          echo "workflow id = $wf_id"
+          echo "获取最近的 workflow runs（每页最多100）..."
+          runs_json=$(curl -s -H "Authorization: token ${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/actions/workflows/${wf_id}/runs?per_page=100")
+          ids=( $(echo "$runs_json" | jq -r '.workflow_runs[] | .id') )
+          total=${#ids[@]}
+          echo "找到 runs 数量: $total"
+          if [ "$total" -le "$KEEP" ]; then
+            echo "保留条数 $KEEP，当前 runs 数量 $total，无需删除。"
+            exit 0
+          fi
+          echo "将保留最近 $KEEP 条，删除超出的旧运行..."
+          for i in "${!ids[@]}"; do
+            if [ "$i" -ge "$KEEP" ]; then
+              id=${ids[$i]}
+              echo "删除 run id=$id ..."
+              curl -s -X DELETE -H "Authorization: token ${TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${REPO}/actions/runs/${id}" || true
+            fi
+          done
+          echo "删除完成。"
